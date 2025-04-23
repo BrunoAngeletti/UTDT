@@ -1,0 +1,768 @@
+# Importación de bibliotecas necesarias
+import pandas as pd
+import numpy as np
+import os
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy.stats import norm
+from scipy.optimize import minimize
+from scipy import stats
+
+# Constantes globales
+TRADING_DAYS_PER_YEAR = 252
+RISK_FREE_RATE = 0.0416
+
+def process_stock_data(stock_prices_csv, benchmark_prices_csv, output_stock_returns_csv, output_benchmark_returns_csv):
+    """
+    Convierte los precios de activos financieros en retornos diarios y guarda los datos alineados en archivos CSV.
+    
+    Args:
+        stock_prices_csv (str): Ruta al archivo CSV con precios de acciones.
+        benchmark_prices_csv (str): Ruta al archivo CSV con precios del índice de referencia.
+        output_stock_returns_csv (str): Ruta para guardar los retornos de las acciones.
+        output_benchmark_returns_csv (str): Ruta para guardar los retornos del índice de referencia.
+    """
+    def process_data(input_csv, output_csv):
+        """
+        Procesa un archivo CSV de precios, calcula retornos diarios y guarda los resultados.
+        
+        Args:
+            input_csv (str): Ruta al archivo CSV de entrada.
+            output_csv (str): Ruta para guardar los retornos calculados.
+            
+        Returns:
+            pd.DataFrame: DataFrame con los retornos diarios, o None si no hay datos válidos.
+        """
+        # Lectura del archivo CSV con formato de fecha específico
+        data = pd.read_csv(input_csv, delimiter=';', index_col='Timestamp',
+                           parse_dates=['Timestamp'], decimal=',',
+                           date_parser=lambda x: pd.to_datetime(x, format='%d/%m/%Y'))
+        data.sort_index(inplace=True)
+
+        # Conversión de columnas a valores numéricos
+        for col in data.columns:
+            data[col] = pd.to_numeric(data[col], errors='coerce')
+
+        # Cálculo de retornos porcentuales y limpieza de datos
+        data = data.pct_change().dropna()
+        data.replace([np.inf, -np.inf], np.nan, inplace=True)
+        data.dropna(inplace=True)
+
+        # Guardado de resultados si hay datos válidos
+        if not data.empty:
+            data.to_csv(output_csv)
+            return data
+        return None
+
+    # Procesamiento de datos de acciones y del índice de referencia
+    stock_returns = process_data(stock_prices_csv, output_stock_returns_csv)
+    benchmark_returns = process_data(benchmark_prices_csv, output_benchmark_returns_csv)
+
+    # Alineación de datos y guardado
+    if stock_returns is not None and benchmark_returns is not None:
+        aligned_stock_returns, aligned_benchmark_returns = stock_returns.align(benchmark_returns, join='inner', axis=0)
+        aligned_stock_returns.to_csv(output_stock_returns_csv)
+        aligned_benchmark_returns.to_csv(output_benchmark_returns_csv)
+
+class PortfolioCVaR:
+    """Clase para optimizar un portafolio utilizando el Valor en Riesgo Condicional (CVaR)."""
+    
+    def __init__(self, returns, confidence_level=0.95):
+        """
+        Inicializa el modelo de optimización CVaR.
+        
+        Args:
+            returns (pd.DataFrame): DataFrame con retornos diarios de los activos.
+            confidence_level (float): Nivel de confianza para el cálculo del CVaR (por defecto, 0.95).
+        """
+        self.returns = returns
+        self.confidence_level = confidence_level
+
+    def compute_cvar_cornish_fisher(self, weights):
+        """
+        Calcula el CVaR utilizando la expansión de Cornish-Fisher según Maillard (2012).
+        
+        Args:
+            weights (np.ndarray): Vector de pesos del portafolio.
+            
+        Returns:
+            float: Magnitud del CVaR (valor positivo que representa la pérdida esperada).
+        """
+        # Cálculo de retornos del portafolio
+        portfolio_returns = self.returns @ weights
+        mean_return = portfolio_returns.mean()
+        std_dev = portfolio_returns.std()
+        skewness = portfolio_returns.skew()
+        kurtosis = portfolio_returns.kurtosis()
+
+        # Parámetros para el nivel de confianza
+        alpha = 1 - self.confidence_level
+        z = norm.ppf(alpha)
+        y_alpha = norm.pdf(z) / alpha  # CVaR gaussiano
+
+        # Coeficientes de ajuste para alpha = 0.05
+        m_alpha = -0.2741
+        p_alpha = -0.1225
+        q_alpha = 0.0711
+
+        # Factor de ajuste según Cornish-Fisher
+        adjustment_factor = 1 + m_alpha * skewness + p_alpha * skewness**2 + q_alpha * kurtosis
+
+        # Cálculo del CVaR ajustado
+        cvar_cf = -y_alpha * adjustment_factor
+        cvar_portfolio = mean_return + std_dev * cvar_cf
+
+        return -cvar_portfolio
+
+    def optimize_weights(self):
+        """
+        Optimiza los pesos del portafolio minimizando el CVaR.
+        
+        Returns:
+            tuple: Pesos optimizados y el CVaR correspondiente.
+        """
+        num_assets = self.returns.shape[1]
+        initial_weights = np.ones(num_assets) / num_assets  # Pesos iniciales uniformes
+
+        # Restricciones de optimización
+        constraints = ({'type': 'eq', 'fun': lambda w: np.sum(w) - 1})
+        bounds = [(0, 1) for _ in range(num_assets)]
+
+        # Optimización numérica
+        result = minimize(self.compute_cvar_cornish_fisher, initial_weights, method='SLSQP',
+                          bounds=bounds, constraints=constraints)
+
+        if result.success:
+            return result.x, self.compute_cvar_cornish_fisher(result.x)
+        else:
+            print("Optimización fallida. Usando pesos iguales.")
+            return initial_weights, self.compute_cvar_cornish_fisher(initial_weights)
+
+def cvar_main(window_size=500, step_size=20, prefix=""):
+    """
+    Ejecuta la optimización del portafolio utilizando CVaR y guarda los resultados.
+    
+    Args:
+        window_size (int): Tamaño de la ventana de datos para la optimización.
+        step_size (int): Intervalo de rebalanceo.
+        prefix (str): Prefijo para los nombres de los archivos de salida.
+    """
+    print(f"\nEjecutando optimización CVaR con Ventana={window_size}, Step={step_size}...")
+    returns = pd.read_csv("csv's/Output/Stocks_Return_Data.csv", index_col=0)
+
+    weights_list, cvar_list, returns_list = [], [], []
+
+    for start in range(0, len(returns) - window_size, step_size):
+        window_returns = returns.iloc[start:start + window_size]
+        next_returns = returns.iloc[start + window_size:start + window_size + step_size]
+
+        # Optimización del portafolio
+        cvar_model = PortfolioCVaR(window_returns)
+        optimized_weights, minimized_cvar = cvar_model.optimize_weights()
+
+        weights_list.append(optimized_weights)
+        cvar_list.append(minimized_cvar)
+
+        # Cálculo de retornos diarios con rebalanceo dinámico
+        initial_portfolio_value = 1.0
+        position_values = optimized_weights * initial_portfolio_value
+        daily_returns = []
+
+        for t in range(len(next_returns)):
+            daily_asset_returns = next_returns.iloc[t].values
+            position_values = position_values * (1 + daily_asset_returns)
+            portfolio_value = np.sum(position_values)
+
+            if t == 0:
+                daily_return = 0
+            else:
+                daily_return = (portfolio_value - previous_portfolio_value) / previous_portfolio_value
+            daily_returns.append(daily_return)
+            previous_portfolio_value = portfolio_value
+
+        returns_list.append(pd.Series(daily_returns, index=next_returns.index, name="portfolio_return"))
+
+    # Guardado de resultados
+    dates = returns.index[window_size::step_size][:len(weights_list)]
+    weights_df = pd.DataFrame(weights_list, columns=returns.columns, index=dates)
+    cvar_df = pd.DataFrame({"CVaR_Optimizado": cvar_list}, index=dates)
+    returns_df = pd.concat(returns_list)
+
+    weights_df.to_csv(f"csv's/Output/{prefix}weights.csv")
+    cvar_df.to_csv(f"csv's/Output/{prefix}cvar.csv")
+    returns_df.to_csv(f"csv's/Output/{prefix}portfolio_returns.csv")
+    print(f"Archivos guardados para {prefix}")
+
+def run_multiple_analyses(window_step_pairs):
+    """
+    Ejecuta la optimización CVaR para múltiples combinaciones de ventana y paso.
+    
+    Args:
+        window_step_pairs (list): Lista de tuplas con combinaciones de (ventana, paso).
+    """
+    print("\nIniciando análisis de múltiples estrategias...\n")
+    for window, step in window_step_pairs:
+        print(f"Ejecutando estrategia: Window={window}, Step={step}")
+        cvar_main(window_size=window, step_size=step, prefix=f"w{window}_s{step}_")
+    print("\n¡Análisis terminado para todas las combinaciones!")
+
+class MultiStrategyAnalyzer:
+    """Clase para analizar múltiples estrategias de portafolio y compararlas con un índice de referencia."""
+    
+    def __init__(self, strategy_csvs, weights_csvs, cvar_csvs, benchmark_csv, output_dir="Resultados",
+                 rolling_window=252, risk_free_rate=0.0416, start_date=None, end_date=None):
+        """
+        Inicializa el analizador de estrategias múltiples.
+        
+        Args:
+            strategy_csvs (dict): Diccionario con rutas a los CSV de retornos de estrategias.
+            weights_csvs (dict): Diccionario con rutas a los CSV de pesos.
+            cvar_csvs (dict): Diccionario con rutas a los CSV de CVaR.
+            benchmark_csv (str): Ruta al CSV del índice de referencia.
+            output_dir (str): Directorio para guardar resultados.
+            rolling_window (int): Ventana para cálculos móviles.
+            risk_free_rate (float): Tasa libre de riesgo.
+            start_date (str): Fecha de inicio (opcional).
+            end_date (str): Fecha de fin (opcional).
+        """
+        self.strategy_csvs = strategy_csvs
+        self.weights_csvs = weights_csvs
+        self.cvar_csvs = cvar_csvs
+        self.benchmark_csv = benchmark_csv
+        self.output_dir = output_dir
+        self.rolling_window = rolling_window
+        self.risk_free_rate = risk_free_rate
+        self.start_date = pd.to_datetime(start_date)
+        self.end_date = pd.to_datetime(end_date)
+
+        self.returns_data = {}
+        self.weights_data = {}
+        self.cvar_data = {}
+        self.aligned_returns = None
+        self.benchmark_returns = None
+
+        if not os.path.exists(self.output_dir):
+            os.makedirs(self.output_dir, exist_ok=True)
+
+    def load_data(self):
+        """Carga los datos desde los archivos CSV."""
+        for name, path in self.strategy_csvs.items():
+            df = pd.read_csv(path, parse_dates=True, index_col=0)
+            if self.start_date:
+                df = df[df.index >= self.start_date]
+            if self.end_date:
+                df = df[df.index <= self.end_date]
+            self.returns_data[name] = df.iloc[:, 0].sort_index()
+
+        for name, path in self.cvar_csvs.items():
+            df = pd.read_csv(path, parse_dates=True, index_col=0)
+            if self.start_date:
+                df = df[df.index >= self.start_date]
+            if self.end_date:
+                df = df[df.index <= self.end_date]
+            self.cvar_data[name] = df.iloc[:, 0].sort_index()
+
+        for name, path in self.weights_csvs.items():
+            df = pd.read_csv(path, parse_dates=True, index_col=0)
+            if self.start_date:
+                df = df[df.index >= self.start_date]
+            if self.end_date:
+                df = df[df.index <= self.end_date]
+            self.weights_data[name] = df.sort_index()
+
+        self.benchmark_returns = pd.read_csv(self.benchmark_csv, parse_dates=True, index_col=0).iloc[:, 0].sort_index()
+        if self.start_date:
+            self.benchmark_returns = self.benchmark_returns[self.benchmark_returns.index >= self.start_date]
+        if self.end_date:
+            self.benchmark_returns = self.benchmark_returns[self.benchmark_returns.index <= self.end_date]
+
+    def align_data(self):
+        """Alinea los retornos de las estrategias con el índice de referencia."""
+        df_returns = pd.concat(self.returns_data, axis=1, join='inner')
+        df_returns = df_returns.join(self.benchmark_returns, how='inner', rsuffix='_benchmark')
+        self.aligned_returns = df_returns.dropna()
+
+    def compute_rolling_sharpe(self):
+        """
+        Calcula el Ratio de Sharpe móvil anualizado para cada estrategia.
+        
+        Returns:
+            pd.DataFrame: DataFrame con los Ratios de Sharpe móviles.
+        """
+        rolling_sharpe = (
+            (self.aligned_returns.rolling(self.rolling_window).mean() - self.risk_free_rate)
+            / self.aligned_returns.rolling(self.rolling_window).std()
+        ) * np.sqrt(252)
+        return rolling_sharpe
+
+    def plot_rolling_sharpe(self):
+        """Genera gráficos del Ratio de Sharpe móvil para cada estrategia."""
+        rolling_sharpe = self.compute_rolling_sharpe()
+
+        for col in self.returns_data.keys():
+            plt.figure(figsize=(12, 6))
+            plt.plot(rolling_sharpe.index, rolling_sharpe[col], label=col)
+            plt.plot(rolling_sharpe.index, rolling_sharpe.iloc[:, -1], label="Benchmark", linestyle='dashed')
+            plt.rcParams['font.family'] = 'Times New Roman'
+            plt.title(f"Ratio de Sharpe Móvil - {col}")
+            plt.ylabel('Ratio de Sharpe')
+            plt.xlabel("Fecha")
+            plt.legend()
+            plt.grid()
+            plt.savefig(os.path.join(self.output_dir, f"{col}_Rolling_Sharpe.png"))
+            plt.close()
+
+        plt.figure(figsize=(12, 6))
+        for col in self.returns_data.keys():
+            plt.plot(rolling_sharpe.index, rolling_sharpe[col], label=col)
+        plt.plot(rolling_sharpe.index, rolling_sharpe.iloc[:, -1], label="Benchmark", linestyle='dashed')
+        plt.rcParams['font.family'] = 'Times New Roman'
+        plt.title("Ratio de Sharpe Móvil - Todas las Estrategias")
+        plt.legend()
+        plt.grid()
+        plt.savefig(os.path.join(self.output_dir, "All_Rolling_Sharpe.png"))
+        plt.close()
+
+    def plot_scatter_return_vs_cvar(self):
+        """Genera gráficos de dispersión de retornos acumulados versus CVaR con regresión lineal."""
+        for col in self.returns_data.keys():
+            plt.figure(figsize=(12, 6))
+            returns = self.returns_data[col]
+            cvar = self.cvar_data.get(col, None)
+            if cvar is None:
+                continue
+
+            cumulative_returns = []
+            cvar_values = []
+            rebalance_dates = list(cvar.index)
+
+            for i in range(1, len(rebalance_dates)):
+                start_date = rebalance_dates[i-1]
+                end_date = rebalance_dates[i]
+
+                if start_date in returns.index and end_date in returns.index:
+                    step_returns = returns.loc[start_date:end_date]
+                    cum_return = (1 + step_returns).prod() - 1
+                    cumulative_returns.append(cum_return)
+                    cvar_values.append(cvar.loc[start_date])
+
+            data_df = pd.DataFrame({
+                "CVaR": cvar_values,
+                "Retorno": cumulative_returns
+            })
+
+            # Regresión lineal
+            slope, intercept, r_value, _, _ = stats.linregress(data_df["CVaR"], data_df["Retorno"])
+            reg_line = intercept + slope * data_df["CVaR"]
+
+            # Configuración estética del gráfico
+            plt.rcParams['font.family'] = 'Times New Roman'
+            plt.scatter(data_df["CVaR"], data_df["Retorno"], alpha=0.7, color='#0F52BA', label='Observaciones')
+            plt.plot(data_df["CVaR"], reg_line, color='black', linestyle='--', linewidth=2, label='Regresión Lineal')
+
+            # Inclusión de la ecuación de regresión y R²
+            eq_text = f"$y = {slope:.4f}x + {intercept:.4f}$\n$R^2 = {r_value**2:.2f}$"
+            plt.text(0.05, 0.95, eq_text, transform=plt.gca().transAxes,
+                     verticalalignment='top', fontsize=12)
+
+            plt.xlabel("CVaR")
+            plt.ylabel("Retorno Acumulado")
+            plt.title(f"Dispersión CVaR vs Retorno - {col}")
+            plt.grid(True)
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig(os.path.join(self.output_dir, f"{col}_Scatter_CVaR_vs_Return.png"))
+            plt.close()
+
+    def plot_kde_distributions(self):
+        """Genera gráficos de densidad kernel (KDE) de los retornos."""
+        for col in self.returns_data.keys():
+            plt.figure(figsize=(12, 6))
+            sns.kdeplot(self.aligned_returns[col], label=col, shade=True)
+            sns.kdeplot(self.aligned_returns.iloc[:, -1], label="Benchmark", shade=True, linestyle='dashed')
+            plt.rcParams['font.family'] = 'Times New Roman'
+            plt.title(f"Distribución de Retornos (KDE) - {col}")
+            plt.xlabel("Retorno Diario")
+            plt.ylabel("Densidad")
+            plt.legend()
+            plt.grid()
+            plt.savefig(os.path.join(self.output_dir, f"{col}_KDE.png"))
+            plt.close()
+
+        plt.figure(figsize=(12, 6))
+        for col in self.returns_data.keys():
+            sns.kdeplot(self.aligned_returns[col], label=col, shade=True)
+        sns.kdeplot(self.aligned_returns.iloc[:, -1], label="Benchmark", shade=True, linestyle='dashed')
+        plt.rcParams['font.family'] = 'Times New Roman'
+        plt.title("Distribución de Retornos (KDE) - Todas las Estrategias")
+        plt.xlabel("Retorno Diario")
+        plt.ylabel("Densidad")
+        plt.legend()
+        plt.grid()
+        plt.savefig(os.path.join(self.output_dir, "All_KDE.png"))
+        plt.close()
+
+    def plot_weights_evolution(self):
+        """Genera gráficos de área para la evolución de los pesos de los activos."""
+        for strategy, df in self.weights_data.items():
+            plt.figure(figsize=(12, 6))
+            df.plot.area(alpha=0.6)
+            plt.rcParams['font.family'] = 'Times New Roman'
+            plt.title(f"Evolución de Pesos - {strategy}")
+            plt.xlabel("Fecha")
+            plt.ylabel("Peso Asignado")
+            plt.legend(loc='upper center', bbox_to_anchor=(0.5, -0.2), ncol=5, fontsize='small')
+            plt.grid()
+            plt.savefig(os.path.join(self.output_dir, f"{strategy}_Weights_Evolution.png"), bbox_inches="tight")
+            plt.close()
+
+    def plot_cumulative_returns(self):
+        """Genera gráficos de retornos acumulados para cada estrategia."""
+        cumulative_returns = (1 + self.aligned_returns).cumprod()
+
+        for col in self.returns_data.keys():
+            plt.figure(figsize=(12, 6))
+            plt.plot(cumulative_returns.index, cumulative_returns[col], label=col)
+            plt.plot(cumulative_returns.index, cumulative_returns.iloc[:, -1], label="Benchmark", linestyle='dashed')
+            plt.rcParams['font.family'] = 'Times New Roman'
+            plt.title(f"Retorno Acumulado - {col}")
+            plt.ylabel("Retorno")
+            plt.xlabel("Fecha")
+            plt.legend(loc='upper center', bbox_to_anchor=(0.5, -0.1), ncol=5, fontsize='small', frameon=False)
+            plt.tight_layout(rect=[0, 0.05, 1, 1])
+            plt.grid()
+            plt.savefig(os.path.join(self.output_dir, f"{col}_Retorno_Acumulado.png"))
+            plt.close()
+
+        plt.figure(figsize=(12, 6))
+        for col in self.returns_data.keys():
+            plt.plot(cumulative_returns.index, cumulative_returns[col], label=col)
+        plt.plot(cumulative_returns.index, cumulative_returns.iloc[:, -1], label="Benchmark", linestyle='dashed')
+        plt.rcParams['font.family'] = 'Times New Roman'
+        plt.title("Retorno Acumulado - Todas las Estrategias")
+        plt.ylabel("Retorno")
+        plt.xlabel("Fecha")
+        plt.legend(loc='upper center', bbox_to_anchor=(0.5, -0.1), ncol=5, fontsize='small', frameon=False)
+        plt.tight_layout(rect=[0, 0.05, 1, 1])
+        plt.grid()
+        plt.savefig(os.path.join(self.output_dir, "All_Retorno_Acumulado.png"))
+        plt.close()
+
+    def compute_statistics(self):
+        """Calcula estadísticas clave para cada portafolio y el índice de referencia."""
+        stats_df = pd.DataFrame(index=list(self.returns_data.keys()) + ["Benchmark"])
+
+        all_returns = self.aligned_returns.copy()
+        all_returns["Benchmark"] = self.benchmark_returns.loc[self.aligned_returns.index]
+
+        stats_df["Retorno Medio Anualizado"] = all_returns.mean() * 252
+        stats_df["Desviación Estándar Anualizada"] = all_returns.std() * np.sqrt(252)
+        stats_df["Asimetría"] = all_returns.skew()
+        stats_df["Curtosis"] = all_returns.kurtosis()
+        stats_df["Sharpe"] = ((all_returns.mean() * 252) - 0.0416) / (all_returns.std() * np.sqrt(252))
+
+        stats_df.to_csv(os.path.join(self.output_dir, "Portfolio_Statistics.csv"))
+        print(stats_df)
+
+    def run_all(self):
+        """Ejecuta todos los análisis y genera los gráficos correspondientes."""
+        print("Cargando datos...")
+        self.load_data()
+        print("Alineando datos...")
+        self.align_data()
+        print("Generando gráficos y estadísticas...")
+        self.plot_scatter_return_vs_cvar()
+        self.plot_weights_evolution()
+        self.plot_rolling_sharpe()
+        self.plot_cumulative_returns()
+        self.plot_kde_distributions()
+        self.compute_statistics()
+
+class RollingSharpeAnalyzer:
+    """Clase para analizar el Ratio de Sharpe móvil de estrategias de portafolio."""
+    
+    def __init__(self, benchmark_file, strategy_csvs, risk_free_rate=0.0, window=252,
+                 start_date=None, end_date=None, output_folder='rolling_sharpe'):
+        """
+        Inicializa el analizador de Ratio de Sharpe móvil.
+        
+        Args:
+            benchmark_file (str): Ruta al archivo CSV del índice de referencia.
+            strategy_csvs (dict): Diccionario con rutas a los CSV de retornos de estrategias.
+            risk_free_rate (float): Tasa libre de riesgo.
+            window (int): Tamaño de la ventana móvil.
+            start_date (str): Fecha de inicio (opcional).
+            end_date (str): Fecha de fin (opcional).
+            output_folder (str): Carpeta para guardar los gráficos.
+        """
+        self.benchmark_file = benchmark_file
+        self.strategy_csvs = strategy_csvs
+        self.risk_free_rate = risk_free_rate
+        self.window = window
+        self.start_date = pd.to_datetime(start_date) if start_date else None
+        self.end_date = pd.to_datetime(end_date) if end_date else None
+        self.output_folder = output_folder
+        self.benchmark_csv = self._load_returns(benchmark_file)
+
+        if not os.path.exists(self.output_folder):
+            os.makedirs(self.output_folder)
+
+    def _load_returns(self, file):
+        """
+        Carga los retornos desde un archivo CSV.
+        
+        Args:
+            file (str): Ruta al archivo CSV.
+            
+        Returns:
+            pd.DataFrame: DataFrame con los retornos.
+        """
+        df = pd.read_csv(file, parse_dates=['Timestamp'], index_col='Timestamp')
+        df.columns = ['returns']
+        return df
+
+    def _rolling_sharpe(self, returns):
+        """
+        Calcula el Ratio de Sharpe móvil.
+        
+        Args:
+            returns (pd.Series): Serie de retornos diarios.
+            
+        Returns:
+            pd.Series: Serie con los Ratios de Sharpe móviles.
+        """
+        excess_returns = returns - self.risk_free_rate / 252
+        rolling_mean = excess_returns.rolling(window=self.window).mean()
+        rolling_std = excess_returns.rolling(window=self.window).std()
+        sharpe = (rolling_mean / rolling_std) * np.sqrt(252)
+        return sharpe
+
+    def analyze_and_plot(self):
+        """Analiza y grafica los Ratios de Sharpe móviles para cada estrategia."""
+        sharpe_df = pd.DataFrame()
+
+        combined_returns = [self._load_returns(file) for file in self.strategy_csvs.values()]
+        combined_returns.append(self.benchmark_csv)
+
+        common_index = combined_returns[0].index
+        for returns_df in combined_returns[1:]:
+            common_index = common_index.intersection(returns_df.index)
+
+        if self.start_date:
+            common_index = common_index[common_index >= self.start_date]
+        if self.end_date:
+            common_index = common_index[common_index <= self.end_date]
+
+        self.benchmark_csv = self.benchmark_csv.loc[common_index]
+
+        # Cálculo de los Ratios de Sharpe
+        sharpe_benchmark = self._rolling_sharpe(self.benchmark_csv['returns'])
+        min_sharpe, max_sharpe = sharpe_benchmark.min(), sharpe_benchmark.max()
+
+        sharpe_values = {}
+        for label, file in self.strategy_csvs.items():
+            portfolio = self._load_returns(file).loc[common_index]
+            sharpe_portfolio = self._rolling_sharpe(portfolio['returns'])
+            sharpe_values[label] = sharpe_portfolio
+            min_sharpe = min(min_sharpe, sharpe_portfolio.min())
+            max_sharpe = max(max_sharpe, sharpe_portfolio.max())
+
+        y_padding = 0.1 * (max_sharpe - min_sharpe)
+        y_min, y_max = min_sharpe - y_padding, max_sharpe + y_padding
+
+        # Generación de gráficos individuales
+        for label, sharpe_portfolio in sharpe_values.items():
+            plot_name = f'{label}_rollingsharpe.png'
+
+            plt.figure(figsize=(12, 6))
+            plt.plot(sharpe_portfolio, label=f'Portafolio {label}')
+            plt.plot(sharpe_benchmark, label='Benchmark')
+            plt.ylim(y_min, y_max)
+            plt.rcParams['font.family'] = 'Times New Roman'
+            plt.title(f'Ratio de Sharpe Móvil (Ventana: {self.window})')
+            plt.ylabel('Ratio de Sharpe')
+            plt.xlabel("Fecha")
+            plt.legend()
+            plt.grid(True)
+            plt.savefig(os.path.join(self.output_folder, plot_name))
+            plt.close()
+
+            sharpe_df[label] = sharpe_portfolio
+
+        # Gráfico consolidado
+        plt.figure(figsize=(12, 6))
+        for col in sharpe_df.columns:
+            plt.plot(sharpe_df[col], label=col)
+        plt.plot(sharpe_benchmark, label='Benchmark', linewidth=2, color='black', linestyle='--')
+        plt.ylim(y_min, y_max)
+        plt.rcParams['font.family'] = 'Times New Roman'
+        plt.title(f'Ratios de Sharpe Móviles Consolidados (Ventana: {self.window})')
+        plt.ylabel('Ratio de Sharpe')
+        plt.xlabel("Fecha")
+        plt.legend()
+        plt.grid(True)
+        plt.savefig(os.path.join(self.output_folder, 'consolidated_rollingsharpe.png'))
+        plt.close()
+
+class DrawdownAnalyzer:
+    """Clase para analizar las máximas caídas acumuladas (drawdowns) de estrategias de portafolio."""
+    
+    def __init__(self, benchmark_file, strategy_csvs, start_date=None, end_date=None, output_folder='drawdown_plots'):
+        """
+        Inicializa el analizador de drawdowns.
+        
+        Args:
+            benchmark_file (str): Ruta al archivo CSV del índice de referencia.
+            strategy_csvs (dict): Diccionario con rutas a los CSV de retornos de estrategias.
+            start_date (str): Fecha de inicio (opcional).
+            end_date (str): Fecha de fin (opcional).
+            output_folder (str): Carpeta para guardar los gráficos.
+        """
+        self.benchmark_file = benchmark_file
+        self.strategy_csvs = strategy_csvs
+        self.start_date = pd.to_datetime(start_date) if start_date else None
+        self.end_date = pd.to_datetime(end_date) if end_date else None
+        self.output_folder = output_folder
+        self.benchmark_csv = self._load_returns(benchmark_file)
+
+        if not os.path.exists(self.output_folder):
+            os.makedirs(self.output_folder)
+
+    def _load_returns(self, file):
+        """
+        Carga los retornos desde un archivo CSV.
+        
+        Args:
+            file (str): Ruta al archivo CSV.
+            
+        Returns:
+            pd.DataFrame: DataFrame con los retornos.
+        """
+        df = pd.read_csv(file, parse_dates=['Timestamp'], index_col='Timestamp')
+        df.columns = ['returns']
+        return df
+
+    def _calculate_drawdown(self, returns):
+        """
+        Calcula la máxima caída acumulada (drawdown).
+        
+        Args:
+            returns (pd.Series): Serie de retornos diarios.
+            
+        Returns:
+            pd.Series: Serie con los valores de drawdown.
+        """
+        cumulative = (1 + returns).cumprod()
+        running_max = cumulative.cummax()
+        drawdown = cumulative / running_max - 1
+        return drawdown
+
+    def analyze_and_plot(self):
+        """Analiza y grafica los drawdowns para cada estrategia."""
+        drawdown_df = pd.DataFrame()
+
+        combined_returns = [self._load_returns(file) for file in self.strategy_csvs.values()]
+        combined_returns.append(self.benchmark_csv)
+
+        common_index = combined_returns[0].index
+        for returns_df in combined_returns[1:]:
+            common_index = common_index.intersection(returns_df.index)
+
+        if self.start_date:
+            common_index = common_index[common_index >= self.start_date]
+        if self.end_date:
+            common_index = common_index[common_index <= self.end_date]
+
+        self.benchmark_csv = self.benchmark_csv.loc[common_index]
+
+        drawdown_benchmark = self._calculate_drawdown(self.benchmark_csv['returns'])
+        min_drawdown = drawdown_benchmark.min()
+
+        drawdown_values = {}
+        for label, file in self.strategy_csvs.items():
+            portfolio = self._load_returns(file).loc[common_index]
+            drawdown_portfolio = self._calculate_drawdown(portfolio['returns'])
+            drawdown_values[label] = drawdown_portfolio
+            min_drawdown = min(min_drawdown, drawdown_portfolio.min())
+
+        y_min = min_drawdown * 1.1
+
+        # Generación de gráficos individuales
+        for label, drawdown_portfolio in drawdown_values.items():
+            plot_name = f'{label}_drawdown.png'
+
+            plt.figure(figsize=(10, 5))
+            plt.plot(drawdown_portfolio, label=f'Portafolio {label}')
+            plt.plot(drawdown_benchmark, label='Benchmark', linestyle='--')
+            plt.rcParams['font.family'] = 'Times New Roman'
+            plt.title(f'Análisis de Drawdown - {label}')
+            plt.ylabel("Máxima Caída Acumulada")
+            plt.xlabel("Fecha")
+            plt.ylim(y_min, 0)
+            plt.legend()
+            plt.grid(True)
+            plt.savefig(os.path.join(self.output_folder, plot_name))
+            plt.close()
+
+            drawdown_df[label] = drawdown_portfolio
+
+        # Gráfico consolidado
+        plt.figure(figsize=(12, 6))
+        for col in drawdown_df.columns:
+            plt.plot(drawdown_df[col], label=col)
+        plt.plot(drawdown_benchmark, label='Benchmark', linewidth=2, linestyle='--', color='black')
+        plt.rcParams['font.family'] = 'Times New Roman'
+        plt.title("Análisis de Drawdown Consolidado")
+        plt.ylabel('Máxima Caída Acumulada')
+        plt.xlabel('Fecha')
+        plt.ylim(y_min, 0)
+        plt.legend()
+        plt.grid(True)
+        plt.savefig(os.path.join(self.output_folder, 'consolidated_drawdown.png'))
+        plt.close()
+
+if __name__ == "__main__":
+    """Bloque principal para ejecutar el análisis de estrategias."""
+    
+    # Definición de combinaciones de ventana y paso
+    window_step_pairs = [(756, 40), (756, 20), (756, 10), (504, 40), (504, 20), (504, 10), (252, 40), (252, 20), (252, 10)]
+    # run_multiple_analyses(window_step_pairs)
+
+    # Configuración de rutas a los archivos CSV
+    strategy_csvs = {f"w{w}_s{s}": f"csv's/Output/w{w}_s{s}_portfolio_returns.csv" for w, s in window_step_pairs}
+    weights_csvs = {f"w{w}_s{s}": f"csv's/Output/w{w}_s{s}_weights.csv" for w, s in window_step_pairs}
+    cvar_csvs = {f"w{w}_s{s}": f"csv's/Output/w{w}_s{s}_cvar.csv" for w, s in window_step_pairs}
+    benchmark_csv = "csv's/Output/Benchmark_Return_Data.csv"
+
+    # Inicialización y ejecución del analizador de estrategias múltiples
+    analyzer = MultiStrategyAnalyzer(
+        strategy_csvs,
+        weights_csvs,
+        cvar_csvs,
+        benchmark_csv,
+        start_date="2022-01-05",
+        end_date="2025-03-11"
+    )
+    analyzer.run_all()
+
+    # Inicialización y ejecución del analizador de Ratio de Sharpe móvil
+    analyzer = RollingSharpeAnalyzer(
+        benchmark_file=benchmark_csv,
+        strategy_csvs=strategy_csvs,
+        risk_free_rate=0.0416,
+        window=252,
+        start_date=None,
+        end_date=None,
+        output_folder='rolling_sharpe'
+    )
+    analyzer.analyze_and_plot()
+
+    # Inicialización y ejecución del analizador de drawdowns
+    analyzer = DrawdownAnalyzer(
+        benchmark_file=benchmark_csv,
+        strategy_csvs=strategy_csvs,
+        start_date=None,
+        end_date=None,
+        output_folder='drawdown_plots'
+    )
+    analyzer.analyze_and_plot()
